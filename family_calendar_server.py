@@ -300,7 +300,6 @@ def create_default_calendar():
     auth = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
     calendar_url = f"http://127.0.0.1:{CALDAV_PORT}/family/"
 
-    # 用 MKCOL 创建日历集合
     req = urllib.request.Request(
         calendar_url, method="MKCOL",
         headers={
@@ -308,18 +307,29 @@ def create_default_calendar():
             "Content-Type": "application/xml; charset=utf-8",
         },
     )
-    try:
-        urllib.request.urlopen(req, timeout=5)
-        print(f"[CalDAV] 默认日历已创建: /family/")
-    except urllib.error.HTTPError as e:
-        if e.code == 405:  # Method Not Allowed = 已存在
-            print(f"[CalDAV] 日历已存在: /family/")
-        elif e.code == 201:  # Created
+
+    # 重试最多 10 次，等 Radicale 启动
+    for i in range(10):
+        try:
+            urllib.request.urlopen(req, timeout=5)
             print(f"[CalDAV] 默认日历已创建: /family/")
-        else:
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (405, 201):
+                print(f"[CalDAV] 日历已存在: /family/")
+                return
             print(f"[CalDAV] 创建日历: HTTP {e.code}")
-    except Exception as e:
-        print(f"[CalDAV] 创建日历失败: {e}")
+            return
+        except ConnectionRefusedError:
+            pass
+        except OSError as e:
+            if "Connection refused" in str(e):
+                pass
+            else:
+                print(f"[CalDAV] 创建日历失败: {e}")
+                return
+        time.sleep(1)
+    print(f"[CalDAV] 无法连接 Radicale，跳过创建日历")
 
 
 def main():
@@ -351,9 +361,7 @@ def main():
     # 启动 CalDAV 服务器
     radicale_proc = start_radicale()
 
-    # 等待 Radicale 启动，然后创建默认日历
-    import time
-    time.sleep(2)
+    # 创建默认日历（内部会重试等待 Radicale 启动）
     create_default_calendar()
 
     # 启动配置指南页面
