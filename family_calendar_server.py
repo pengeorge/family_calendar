@@ -15,6 +15,7 @@
 
 import http.server
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -27,6 +28,27 @@ SETUP_PORT = 8082
 DATA_DIR = os.path.join(SCRIPT_DIR, "caldav_data")
 USERS_FILE = os.path.join(SCRIPT_DIR, "radicale_users.htpasswd")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "radicale_config.cfg")
+USERNAME = "family"
+PASSWORD = "family2026"
+
+
+def generate_password_hash(password):
+    """使用 bcrypt 生成密码哈希（兼容 Radicale）"""
+    try:
+        import bcrypt
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    except ImportError:
+        pass
+    try:
+        import hashlib
+        salt = os.urandom(16)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+        return "$pbkdf2-sha256$100000${}${}".format(
+            salt.hex(), dk.hex()
+        )
+    except Exception:
+        pass
+    return password
 
 
 def generate_config():
@@ -37,7 +59,7 @@ hosts = 0.0.0.0:{CALDAV_PORT}
 [auth]
 type = htpasswd
 htpasswd_filename = {USERS_FILE}
-htpasswd_encryption = plain
+htpasswd_encryption = bcrypt
 
 [storage]
 type = multifilesystem
@@ -45,9 +67,45 @@ filesystem_folder = {DATA_DIR}
 
 [rights]
 type = authenticated
+
+[logging]
+level = warning
 """
     with open(CONFIG_FILE, "w") as f:
         f.write(config)
+
+
+def ensure_users():
+    """确保用户文件存在且密码正确"""
+    if not os.path.exists(USERS_FILE):
+        # 使用 Radicale 自带的 htpasswd 工具生成
+        # 先尝试用 bcrypt 库生成
+        try:
+            import bcrypt
+            pw_hash = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt()).decode()
+            with open(USERS_FILE, "w") as f:
+                f.write(f"{USERNAME}:{pw_hash}\n")
+            print(f"[Auth] 用户 {USERNAME} 已创建 (bcrypt)")
+            return
+        except ImportError:
+            pass
+
+        # 如果没有 bcrypt 库，用 subprocess 调用 Radicale 的密码管理
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "radicale", "--config", CONFIG_FILE,
+                 "--manage-passwords", "add", USERNAME],
+                input=f"{PASSWORD}\n{PASSWORD}\n",
+                capture_output=True, text=True, timeout=10,
+                cwd=SCRIPT_DIR,
+            )
+            print(f"[Auth] 用户已创建: {result.stdout.strip()}")
+        except Exception as e:
+            print(f"[Auth] 创建用户失败: {e}")
+            # 回退到明文
+            with open(USERS_FILE, "w") as f:
+                f.write(f"{USERNAME}:{PASSWORD}\n")
+            print(f"[Auth] 回退到明文密码")
 
 
 def get_local_ip():
@@ -231,6 +289,37 @@ def ensure_dirs():
     """确保数据目录和配置文件存在"""
     os.makedirs(DATA_DIR, exist_ok=True)
     generate_config()
+    ensure_users()
+
+
+def create_default_calendar():
+    """创建默认日历集合（iPhone 需要至少一个日历才能验证成功）"""
+    import urllib.request
+    import base64
+
+    auth = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+    calendar_url = f"http://127.0.0.1:{CALDAV_PORT}/family/"
+
+    # 用 MKCOL 创建日历集合
+    req = urllib.request.Request(
+        calendar_url, method="MKCOL",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/xml; charset=utf-8",
+        },
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        print(f"[CalDAV] 默认日历已创建: /family/")
+    except urllib.error.HTTPError as e:
+        if e.code == 405:  # Method Not Allowed = 已存在
+            print(f"[CalDAV] 日历已存在: /family/")
+        elif e.code == 201:  # Created
+            print(f"[CalDAV] 默认日历已创建: /family/")
+        else:
+            print(f"[CalDAV] 创建日历: HTTP {e.code}")
+    except Exception as e:
+        print(f"[CalDAV] 创建日历失败: {e}")
 
 
 def main():
@@ -261,6 +350,11 @@ def main():
 
     # 启动 CalDAV 服务器
     radicale_proc = start_radicale()
+
+    # 等待 Radicale 启动，然后创建默认日历
+    import time
+    time.sleep(2)
+    create_default_calendar()
 
     # 启动配置指南页面
     try:
