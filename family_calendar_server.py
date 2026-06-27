@@ -77,36 +77,21 @@ level = warning
 
 
 def ensure_users():
-    """确保用户文件存在且密码正确"""
-    if not os.path.exists(USERS_FILE):
-        # 使用 Radicale 自带的 htpasswd 工具生成
-        # 先尝试用 bcrypt 库生成
-        try:
-            import bcrypt
-            pw_hash = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt()).decode()
-            with open(USERS_FILE, "w") as f:
-                f.write(f"{USERNAME}:{pw_hash}\n")
-            print(f"[Auth] 用户 {USERNAME} 已创建 (bcrypt)")
-            return
-        except ImportError:
-            pass
+    """确保用户文件存在且密码正确（使用 bcrypt 加密）"""
+    if os.path.exists(USERS_FILE):
+        return
 
-        # 如果没有 bcrypt 库，用 subprocess 调用 Radicale 的密码管理
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "radicale", "--config", CONFIG_FILE,
-                 "--manage-passwords", "add", USERNAME],
-                input=f"{PASSWORD}\n{PASSWORD}\n",
-                capture_output=True, text=True, timeout=10,
-                cwd=SCRIPT_DIR,
-            )
-            print(f"[Auth] 用户已创建: {result.stdout.strip()}")
-        except Exception as e:
-            print(f"[Auth] 创建用户失败: {e}")
-            # 回退到明文
-            with open(USERS_FILE, "w") as f:
-                f.write(f"{USERNAME}:{PASSWORD}\n")
-            print(f"[Auth] 回退到明文密码")
+    # 尝试用 bcrypt 库生成
+    try:
+        import bcrypt
+        pw_hash = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt()).decode()
+        with open(USERS_FILE, "w") as f:
+            f.write(f"{USERNAME}:{pw_hash}\n")
+        print(f"[Auth] 用户 {USERNAME} 已创建 (bcrypt)")
+        return
+    except ImportError:
+        print("[Auth] bcrypt 未安装，请运行: pip install bcrypt")
+        sys.exit(1)
 
 
 def get_local_ip():
@@ -261,9 +246,15 @@ def start_radicale():
     proc = subprocess.Popen(
         [sys.executable, "-m", "radicale", "--config", CONFIG_FILE],
         cwd=SCRIPT_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    # 等一小会儿，检查是否立即崩溃
+    time.sleep(1)
+    if proc.poll() is not None:
+        _, stderr = proc.communicate()
+        print(f"[CalDAV] Radicale 启动失败:\n{stderr.decode()}")
+        sys.exit(1)
     return proc
 
 
@@ -296,22 +287,22 @@ def ensure_dirs():
 def create_default_calendar():
     """创建默认日历集合（iPhone 需要至少一个日历才能验证成功）"""
     import urllib.request
+    import urllib.error
     import base64
 
     auth = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
     calendar_url = f"http://127.0.0.1:{CALDAV_PORT}/family/"
 
-    req = urllib.request.Request(
-        calendar_url, method="MKCOL",
-        headers={
-            "Authorization": f"Basic {auth}",
-            "Content-Type": "application/xml; charset=utf-8",
-        },
-    )
-
-    # 重试最多 10 次，等 Radicale 启动
-    for i in range(10):
+    # 重试最多 15 次，等 Radicale 启动
+    for i in range(15):
         try:
+            req = urllib.request.Request(
+                calendar_url, method="MKCOL",
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "Content-Type": "application/xml; charset=utf-8",
+                },
+            )
             urllib.request.urlopen(req, timeout=5)
             print(f"[CalDAV] 默认日历已创建: /family/")
             return
@@ -321,15 +312,18 @@ def create_default_calendar():
                 return
             print(f"[CalDAV] 创建日历: HTTP {e.code}")
             return
-        except ConnectionRefusedError:
-            pass
-        except OSError as e:
-            if "Connection refused" in str(e):
-                pass
-            else:
-                print(f"[CalDAV] 创建日历失败: {e}")
-                return
-        time.sleep(1)
+        except (urllib.error.URLError, ConnectionRefusedError, OSError) as e:
+            msg = str(e)
+            if "Connection refused" in msg or "timed out" in msg.lower() or "getaddrinfo" in msg:
+                if i == 0:
+                    print(f"[CalDAV] 等待 Radicale 启动...")
+                time.sleep(1)
+                continue
+            print(f"[CalDAV] 创建日历失败: {e}")
+            return
+        except Exception as e:
+            print(f"[CalDAV] 创建日历异常: {e}")
+            return
     print(f"[CalDAV] 无法连接 Radicale，跳过创建日历")
 
 
